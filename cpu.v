@@ -2,6 +2,7 @@
 `define WORD_SIZE 16    // data and address word size
 `include "opcodes.v"
 `include "ALU.v"
+`include "perceptron_branch_predictor.v"
 
 module Register(clk, rs1, rs2, rd, writeData, readData1, readData2, regWrite, reset_n);
 	input clk;
@@ -782,6 +783,14 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	wire [3:0] ID_opCode, EX_opCode, EX_ALUOp, MEM_opCode, WB_opCode;
 	wire [5:0] ID_funcCode, EX_funcCode, MEM_funcCode, WB_funcCode;
 
+	// Branch predictor signals
+	wire IF_branchPrediction;
+	wire [7:0] IF_predictorHashIndex;
+	wire ID_isBranch, EX_isBranch, MEM_isBranch, WB_isBranch;
+	wire signed [15:0] EX_yValue;
+	wire [15:0] WB_branchPC;
+	wire EX_branchActual, MEM_branchActual, WB_branchActual;
+
 	assign readM1 = reset_n;
 	assign readM2 = MEM_memRead;
 	assign writeM2 = MEM_memWrite;
@@ -798,6 +807,19 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	HazardUnit hazardUnit(reset_n, ID_rs1, ID_rs2, EX_rd, EX_memRead, IF_PCWrite, ID_IDWrite, ID_FlushFlag, ID_EXWrite, PCCtrl);
 	ForwardUnit forwardUnit(EX_rs1, EX_rs2, MEM_rd, WB_rd, EX_opCode, EX_funcCode, MEM_regWrite, WB_regWrite, EX_forwardA, EX_forwardB);
 
+	// Branch Predictor Unit
+	PerceptronPredictionUnit branchPredictor(
+		.clk(clk),
+		.reset_n(reset_n),
+		.branch_pc(IF_outputPC),
+		.prediction(IF_branchPrediction),
+		.train_enable(WB_isBranch && WB_WriteFlag),
+		.train_pc(WB_branchPC),
+		.train_actual(WB_branchActual),  // Use actual branch outcome from EX stage
+		.last_y(EX_yValue),
+		.hash_index(IF_predictorHashIndex)
+	);
+
 	// IF stage
 	MUX4to1 PCSelector(IF_outputPC + 1'd1, EX_PC + 1'd1 + EX_immediate, EX_immExtend, EX_ALUInput1, PCCtrl, IF_writePC);
 	PC pc(IF_writePC, IF_outputPC, clk, reset_n, IF_PCWrite);
@@ -809,6 +831,8 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	assign ID_opCode = ID_instruction[15:12];
 	assign ID_funcCode = ID_instruction[5:0];
 	assign ID_numInst = (ID_EXWrite && reset_n);
+	// Detect if instruction is a branch
+	assign ID_isBranch = (ID_opCode == `BNE_OP || ID_opCode == `BEQ_OP || ID_opCode == `BGZ_OP || ID_opCode == `BLZ_OP);
 	IDPipeline Pipeline_ID(clk, IF_instruction, IF_outputPC, ID_instruction, ID_PC, ID_rdSelector, ID_IDWrite, ID_FlushFlag);
 	MUXPC MUX_ID_rd(ID_instruction[7:6] + 3'b000, ID_instruction[9:8] + 3'b000, 3'b10, ID_rdSelector, ID_rd);
 	
@@ -818,9 +842,24 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	// EX stage
 	EXPipeline Pipeline_EX(clk, ID_PC, ID_numInst, ID_opCode, ID_funcCode, ID_rs1, ID_rs2, ID_rd, ID_immediate, ID_readData1, ID_readData2, (ID_EXWrite && reset_n), 
 							EX_memRead, EX_ALUSrc, EX_PC, EX_numInst, EX_opCode, EX_funcCode, EX_rs1, EX_rs2, EX_rd, EX_immediate, EX_readData1, EX_readData2, EX_PCCtrl, EX_WriteFlag);
-	ImmExtender immExtender(EX_PC, EX_immediate, EX_immExtend);
-	MUX2to1 MUX_EX_ALUSrc2(EX_readData2, EX_immediate, EX_ALUSrc, EX_ALUSrc2);
-	MUX4to1 MUX_EX_ALUInput1(EX_readData1, WB_writeData, MEM_ALUResult, `WORD_SIZE'b0, EX_forwardA, EX_ALUInput1);
+	// Pipeline branch signal through EX stage
+	always @(posedge clk) begin
+		if (!reset_n) begin
+			EX_isBranch <= 1'b0;
+			EX_branchActual <= 1'b0;
+			EX_yValue <= 16'h0000;
+		end else if (ID_IDWrite) begin
+			EX_isBranch <= ID_isBranch;
+			// Compute y-value for training (dot product of weights and history would be done by predictor)
+			// Here we just track if a branch occurs for training purposes
+			EX_yValue <= 16'h0000;  // Placeholder - actual y comes from predictor internally
+		end else begin
+			EX_isBranch <= 1'b0;
+			EX_branchActual <= 1'b0;
+		end
+	end
+	// Set actual branch outcome based on ALU result - combinatorial (ready immediately)
+	assign EX_branchActual = EX_bCond;
 	MUX4to1 MUX_EX_ALUInput2(EX_ALUSrc2, MEM_ALUResult, WB_writeData, `WORD_SIZE'b0, EX_forwardB, EX_ALUInput2);
 	ALUControl aluContol(EX_opCode, EX_funcCode, EX_ALUOp);
 	ALU alu(EX_ALUInput1, EX_ALUInput2, EX_ALUOp, EX_ALUResult, EX_bCond);
@@ -828,10 +867,32 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	// MEM stage
 	MEMPipeline Pipeline_MEM(clk, EX_PC, (PCCtrl != 0 ? 1'b0 : EX_numInst), EX_opCode, EX_funcCode, EX_rs1, EX_rs2, EX_rd, EX_immediate, EX_ALUResult, EX_ALUInput1, EX_readData2, EX_memRead, EX_WriteFlag,
 							MEM_memRead, MEM_memWrite, MEM_regWrite, MEM_PC, MEM_numInst, MEM_opCode, MEM_funcCode, MEM_rs1, MEM_rs2, MEM_rd, MEM_immediate, MEM_ALUResult, MEM_readData1, MEM_readData2, MEM_WriteFlag);
+	// Pipeline branch signal through MEM stage
+	always @(posedge clk) begin
+		if (!reset_n) begin
+			MEM_isBranch <= 1'b0;
+			MEM_branchActual <= 1'b0;
+		end else begin
+			MEM_isBranch <= EX_isBranch;
+			MEM_branchActual <= EX_branchActual;  // Track actual branch outcome
+		end
+	end
 
 	// WB stage
 	WBPipeline Pipeline_WB(clk, MEM_PC, MEM_numInst, MEM_opCode, MEM_funcCode, MEM_rs1, MEM_rs2, MEM_rd, MEM_immediate, MEM_ALUResult, MEM_readData, MEM_readData1, MEM_WriteFlag,
-							WB_dataSelector, WB_regWrite, WB_isHalt, WB_isWWD, WB_PC, WB_numInst, WB_opCode, WB_funcCode, WB_rs1, WB_rs2, WB_rd, WB_immediate, WB_ALUResult, WB_readData, WB_readData1, WB_WriteFlag);
+						WB_dataSelector, WB_regWrite, WB_isHalt, WB_isWWD, WB_PC, WB_numInst, WB_opCode, WB_funcCode, WB_rs1, WB_rs2, WB_rd, WB_immediate, WB_ALUResult, WB_readData, WB_readData1, WB_WriteFlag);
+	// Pipeline branch signal through WB stage and track branch PC for training
+	always @(posedge clk) begin
+		if (!reset_n) begin
+			WB_isBranch <= 1'b0;
+			WB_branchPC <= 16'h0000;
+			WB_branchActual <= 1'b0;
+		end else begin
+			WB_isBranch <= MEM_isBranch;
+			WB_branchPC <= MEM_PC;  // Track the PC of the branch for training
+			WB_branchActual <= MEM_branchActual;  // Track actual branch outcome for training
+		end
+	end
 	MUX4to1 MUX_WB_writeData(WB_ALUResult, WB_readData, WB_PC + `WORD_SIZE'b1, WB_immediate, WB_dataSelector, WB_writeData);
 
 	initial begin
