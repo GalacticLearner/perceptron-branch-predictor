@@ -34,12 +34,9 @@ module Register(clk, rs1, rs2, rd, writeData, readData1, readData2, regWrite, re
 		r[3] = 0;
 	end
 
-	always @(rd or writeData or regWrite) begin
-		if(regWrite == 1) begin
-			r[rd] = writeData;
-		end
-		else begin
-			r[rd] = r[rd];
+	always @(posedge clk) begin
+		if (regWrite == 1 && reset_n == 1) begin
+			r[rd] <= writeData;
 		end
 	end
 endmodule
@@ -327,6 +324,10 @@ module WBControl(opCode, funcCode, dataSelector, regWrite, isHalt, isWWD, writeF
 	end
 
 	always @(opCode or funcCode or writeFlag) begin
+		// isWWD and isHalt should be independent of writeFlag
+		isHalt = (opCode == `ALU_OP && funcCode == 29 ? 1 : 0);
+		isWWD = (opCode == 4'd15 && funcCode == 6'd28);
+		
 		if(writeFlag) begin
 			if(opCode == `LWD_OP)
 				dataSelector = 1;
@@ -338,14 +339,10 @@ module WBControl(opCode, funcCode, dataSelector, regWrite, isHalt, isWWD, writeF
 				dataSelector = 0;
 
 			regWrite = (opCode == `JAL_OP || opCode == `LWD_OP || (opCode == `ALU_OP && funcCode != `INST_FUNC_JPR && funcCode != 6'h1c) || opCode == `LHI_OP || opCode == `ADI_OP || opCode == `ORI_OP) ? 1 : 0;
-			isHalt = (opCode == `ALU_OP && funcCode == 29 ? 1 : 0);
-			isWWD = (opCode == 4'd15 && funcCode == 6'd28);
 		end
 		else begin
 			dataSelector = 0;
 			regWrite = 0;
-			isHalt = 0;
-			isWWD = 0;
 		end
 	end
 endmodule
@@ -388,6 +385,7 @@ module GeneralPipeline(clk, inPC, inNumInst, inOpCode, inFuncCode, inRS1, inRS2,
 		rd = 4;
 		PC = 0;
 		numInst = 0;
+		writeFlag = 0;
 	end
 
 	always @(posedge clk) begin
@@ -782,14 +780,17 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 
 	wire [3:0] ID_opCode, EX_opCode, EX_ALUOp, MEM_opCode, WB_opCode;
 	wire [5:0] ID_funcCode, EX_funcCode, MEM_funcCode, WB_funcCode;
+	wire ID_writeFlag;
 
 	// Branch predictor signals
 	wire IF_branchPrediction;
 	wire [7:0] IF_predictorHashIndex;
-	wire ID_isBranch, EX_isBranch, MEM_isBranch, WB_isBranch;
-	wire signed [15:0] EX_yValue;
-	wire [15:0] WB_branchPC;
-	wire EX_branchActual, MEM_branchActual, WB_branchActual;
+	wire ID_isBranch;
+	reg EX_isBranch, MEM_isBranch, WB_isBranch;
+	reg signed [15:0] EX_yValue;
+	reg [15:0] WB_branchPC;
+	wire EX_branchActual;
+	reg MEM_branchActual, WB_branchActual;
 
 	assign readM1 = reset_n;
 	assign readM2 = MEM_memRead;
@@ -831,6 +832,15 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	assign ID_opCode = ID_instruction[15:12];
 	assign ID_funcCode = ID_instruction[5:0];
 	assign ID_numInst = (ID_EXWrite && reset_n);
+	// Decode writeFlag based on instruction type - determines if instruction writes to register/memory
+	// writeFlag is 1 for register-writing instructions, 0 for WWD/HALT/branches
+	// Force writeFlag to 0 for WWD and HALT
+	assign ID_writeFlag = ((ID_opCode == `ALU_OP && (ID_funcCode == 6'd28 || ID_funcCode == 6'd29)) ? 0 :
+		(ID_opCode == `JAL_OP || ID_opCode == `LWD_OP || 
+		(ID_opCode == `ALU_OP && ID_funcCode != `INST_FUNC_JPR && ID_funcCode != 6'd29 && ID_funcCode != 6'd28) || 
+		ID_opCode == `LHI_OP || ID_opCode == `ADI_OP || ID_opCode == `ORI_OP) ? 1 : 0);
+	// Explicitly ensure WWD and HALT never set writeFlag
+	// (already covered by funcCode != 6'd28/29 above, but this is extra safety)
 	// Detect if instruction is a branch
 	assign ID_isBranch = (ID_opCode == `BNE_OP || ID_opCode == `BEQ_OP || ID_opCode == `BGZ_OP || ID_opCode == `BLZ_OP);
 	IDPipeline Pipeline_ID(clk, IF_instruction, IF_outputPC, ID_instruction, ID_PC, ID_rdSelector, ID_IDWrite, ID_FlushFlag);
@@ -840,13 +850,12 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	ImmediateGenerator immGen(ID_instruction, ID_immediate);
 
 	// EX stage
-	EXPipeline Pipeline_EX(clk, ID_PC, ID_numInst, ID_opCode, ID_funcCode, ID_rs1, ID_rs2, ID_rd, ID_immediate, ID_readData1, ID_readData2, (ID_EXWrite && reset_n), 
+	EXPipeline Pipeline_EX(clk, ID_PC, ID_numInst, ID_opCode, ID_funcCode, ID_rs1, ID_rs2, ID_rd, ID_immediate, ID_readData1, ID_readData2, ID_writeFlag, 
 							EX_memRead, EX_ALUSrc, EX_PC, EX_numInst, EX_opCode, EX_funcCode, EX_rs1, EX_rs2, EX_rd, EX_immediate, EX_readData1, EX_readData2, EX_PCCtrl, EX_WriteFlag);
 	// Pipeline branch signal through EX stage
 	always @(posedge clk) begin
 		if (!reset_n) begin
 			EX_isBranch <= 1'b0;
-			EX_branchActual <= 1'b0;
 			EX_yValue <= 16'h0000;
 		end else if (ID_IDWrite) begin
 			EX_isBranch <= ID_isBranch;
@@ -855,7 +864,6 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 			EX_yValue <= 16'h0000;  // Placeholder - actual y comes from predictor internally
 		end else begin
 			EX_isBranch <= 1'b0;
-			EX_branchActual <= 1'b0;
 		end
 	end
 	// Set actual branch outcome based on ALU result - combinatorial (ready immediately)
@@ -865,8 +873,8 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	ALU alu(EX_ALUInput1, EX_ALUInput2, EX_ALUOp, EX_ALUResult, EX_bCond);
 
 	// MEM stage
-	MEMPipeline Pipeline_MEM(clk, EX_PC, (PCCtrl != 0 ? 1'b0 : EX_numInst), EX_opCode, EX_funcCode, EX_rs1, EX_rs2, EX_rd, EX_immediate, EX_ALUResult, EX_ALUInput1, EX_readData2, EX_memRead, EX_WriteFlag,
-							MEM_memRead, MEM_memWrite, MEM_regWrite, MEM_PC, MEM_numInst, MEM_opCode, MEM_funcCode, MEM_rs1, MEM_rs2, MEM_rd, MEM_immediate, MEM_ALUResult, MEM_readData1, MEM_readData2, MEM_WriteFlag);
+	MEMPipeline Pipeline_MEM(clk, EX_PC, (PCCtrl != 0 ? 1'b0 : EX_numInst), EX_opCode, EX_funcCode, EX_rs1, EX_rs2, EX_rd, EX_immExtend, EX_ALUResult, EX_readData1, EX_readData2, EX_memRead, EX_WriteFlag,
+							MEM_memRead, MEM_memWrite, MEM_regWrite, MEM_PC, MEM_numInst, MEM_opCode, MEM_funcCode, MEM_rs1, MEM_rs2, MEM_rd, MEM_immExtend, MEM_ALUResult, MEM_readData1, MEM_readData2, MEM_WriteFlag);
 	// Pipeline branch signal through MEM stage
 	always @(posedge clk) begin
 		if (!reset_n) begin
@@ -901,16 +909,14 @@ module cpu(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, dat
 	end
 
 	always @(posedge reset_n) begin
-		num_inst = -1;
-		output_port = 0;
+		num_inst <= -1;
+		output_port <= 0;
 	end
 
 	always @(posedge clk) begin
-		num_inst = num_inst + WB_numInst;
-	end
-
-	always @(posedge WB_isWWD) begin
-		output_port = WB_readData1;
+		num_inst <= num_inst + WB_numInst;
+		if (WB_isWWD)
+			output_port <= WB_readData1;
 	end
 
 endmodule

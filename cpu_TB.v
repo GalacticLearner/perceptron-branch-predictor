@@ -24,12 +24,11 @@ module cpu_TB();
 
 	// instantiate the unit under test
 	cpu UUT (clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, data2, num_inst, output_port, is_halted);
-	Memory NUUT(!clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, data2);
+	Memory NUUT(clk, reset_n, readM1, address1, data1, readM2, writeM2, address2, data2);
 
 	// initialize inputs
 	initial begin
-		clk = 0;           // set initial clock value	
-		
+		clk = 0;           // set initial clock value    
 		reset_n = 1;       // generate a LOW pulse for reset_n
 		#(`PERIOD1/4) reset_n = 0;
 		#(`PERIOD1 + `PERIOD1/2) reset_n = 1;
@@ -37,6 +36,13 @@ module cpu_TB();
 
 	// generate the clock
 	always #(`PERIOD1/2)clk = ~clk;  // generates a clock (period = `PERIOD1)
+	
+	// Debug monitor
+	initial begin
+		#200;
+		$monitor("T=%0t: ID(op=%h fn=%h) WB(op=%h fn=%h WF=%b) | WWD=%b out=%h | num=%h", 
+				$time, UUT.ID_opCode, UUT.ID_funcCode, UUT.WB_opCode, UUT.WB_funcCode, UUT.WB_WriteFlag, UUT.WB_isWWD, output_port, num_inst);
+	end
 		
 	event testbench_finish;	// This event will finish the testbench.
 	initial #(`PERIOD1*10000) -> testbench_finish; // Only 10,000 cycles are allowed.
