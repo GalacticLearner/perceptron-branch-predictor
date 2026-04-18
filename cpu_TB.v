@@ -38,14 +38,7 @@ module cpu_TB();
 
     always #(`PERIOD1/2) clk = ~clk;
 
-    initial begin
-        #200;
-        $monitor("T=%0t: ID(op=%h fn=%h) WB(op=%h fn=%h WF=%b) | WWD=%b out=%h | num=%h", 
-            $time, UUT.ID_opCode, UUT.ID_funcCode,
-            UUT.WB_opCode, UUT.WB_funcCode,
-            UUT.WB_WriteFlag, UUT.WB_isWWD,
-            output_port, num_inst);
-    end
+    
 
     event testbench_finish;
     initial #(`PERIOD1*10000) -> testbench_finish;
